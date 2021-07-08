@@ -104,8 +104,10 @@ const shutdown = async (opts) => {
   if (cloud) {
     await destroyTerraform();
   } else {
-    await unregisterRunner();
-    await retryWorkflows();
+    console.log("DEBUG: call unregisterRunner")
+    console.log(await unregisterRunner());
+    console.log("DEBUG: call retryWorkflows");
+    console.log(await retryWorkflows());
 
     await destroyDockerMachine();
     await destroyTerraform();
