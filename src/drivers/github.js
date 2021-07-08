@@ -358,6 +358,7 @@ class Github {
     const { owner, repo } = ownerRepo({ uri: this.repo });
     const { actions } = octokit(this.token, this.repo);
 
+    console.log("DEBUG: calling pipelineRestart")
     const {
       data: { run_id: runId }
     } = await actions.getJobForWorkflowRun({
@@ -373,7 +374,7 @@ class Github {
         run_id: runId
       });
     } catch (err) {
-      // HANDLES: Cannot cancel a workflow run that is completed.
+      console.log("DEBUG: catch 1 " + JSON.stringify(err))
     }
 
     const {
@@ -391,7 +392,9 @@ class Github {
           repo,
           run_id: runId
         });
-      } catch (err) {}
+      } catch (err) {
+        console.log("DEBUG: catch 2 " + JSON.stringify(err))
+      }
     }
   }
 
