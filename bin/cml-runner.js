@@ -58,6 +58,7 @@ const shutdown = async (opts) => {
 
   const retryWorkflows = async () => {
     try {
+      console.log(["DEBUG: conditions", noRetry, RUNNER_JOBS_RUNNING])
       if (!noRetry && RUNNER_JOBS_RUNNING.length) {
         await Promise.all(
           RUNNER_JOBS_RUNNING.map(
