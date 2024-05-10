@@ -6,22 +6,28 @@ const fetch = require('node-fetch');
 
 const github = require('@actions/github');
 const { Octokit } = require('@octokit/rest');
+const { withCustomRequest } = require('@octokit/graphql');
 const { throttling } = require('@octokit/plugin-throttling');
 const tar = require('tar');
-const ProxyAgent = require('proxy-agent');
+const { ProxyAgent } = require('proxy-agent');
 
-const { download, exec } = require('../utils');
-const winston = require('winston');
+const { download, exec, sleep } = require('../utils');
+const { logger } = require('../logger');
 
 const CHECK_TITLE = 'CML Report';
 process.env.RUNNER_ALLOW_RUNASROOT = 1;
 
 const {
-  GITHUB_REPOSITORY,
-  GITHUB_SHA,
-  GITHUB_REF,
+  CI,
+  GITHUB_EVENT_NAME,
   GITHUB_HEAD_REF,
-  GITHUB_EVENT_NAME
+  GITHUB_REF,
+  GITHUB_REPOSITORY,
+  GITHUB_RUN_ID,
+  GITHUB_SHA,
+  GITHUB_TOKEN,
+  GITHUB_WORKFLOW,
+  TPI_TASK
 } = process.env;
 
 const branchName = (branch) => {
@@ -44,28 +50,32 @@ const ownerRepo = (opts) => {
   return { owner, repo };
 };
 
-const octokit = (token, repo) => {
+const octokit = (token, repo, log) => {
   if (!token) throw new Error('token not found');
 
-  const throttleHandler = (retryAfter, options) => {
+  const throttleHandler = (reason, offset) => async (retryAfter, options) => {
     if (options.request.retryCount <= 5) {
-      winston.info(`Retrying after ${retryAfter} seconds!`);
+      logger.info(
+        `Retrying because of ${reason} in ${retryAfter + offset} seconds`
+      );
+      await new Promise((resolve) => setTimeout(resolve, offset * 1000));
       return true;
     }
   };
   const octokitOptions = {
     request: { agent: new ProxyAgent() },
     auth: token,
+    log,
     throttle: {
-      onRateLimit: throttleHandler,
-      onAbuseLimit: throttleHandler
+      onAbuseLimit: throttleHandler('abuse limit', 120), // deprecated, see onSecondaryRateLimit
+      onRateLimit: throttleHandler('rate limit', 30),
+      onSecondaryRateLimit: throttleHandler('secondary rate limit', 30)
     }
   };
-
-  if (!repo.includes('github.com')) {
+  const { host, hostname } = new url.URL(repo);
+  if (hostname !== 'github.com') {
     // GitHub Enterprise, use the: repo URL host + '/api/v3' - as baseURL
     // as per: https://developer.github.com/enterprise/v3/enterprise-admin/#endpoint-urls
-    const { host } = new url.URL(repo);
     octokitOptions.baseUrl = `https://${host}/api/v3`;
   }
 
@@ -89,7 +99,14 @@ class Github {
     return ownerRepo({ uri });
   }
 
-  async commentCreate(opts = {}) {
+  async user({ name: username } = {}) {
+    const { users } = octokit(this.token, this.repo);
+    const { data: user } = await users.getByUsername({ username });
+
+    return user;
+  }
+
+  async commitCommentCreate(opts = {}) {
     const { report: body, commitSha } = opts;
     const { repos } = octokit(this.token, this.repo);
 
@@ -102,7 +119,7 @@ class Github {
     ).data.html_url;
   }
 
-  async commentUpdate(opts = {}) {
+  async commitCommentUpdate(opts = {}) {
     const { report: body, id } = opts;
     const { repos } = octokit(this.token, this.repo);
 
@@ -164,6 +181,15 @@ class Github {
       status = 'completed'
     } = opts;
 
+    const warning =
+      'This command only works inside a Github runner or a Github app.';
+
+    if (!CI || TPI_TASK) logger.warn(warning);
+    if (GITHUB_TOKEN && GITHUB_TOKEN !== this.token)
+      logger.warn(
+        `Your token is different than the GITHUB_TOKEN, this command does not work with PAT. ${warning}`
+      );
+
     const name = title;
     return await octokit(this.token, this.repo).checks.create({
       ...ownerRepo({ uri: this.repo }),
@@ -183,7 +209,7 @@ class Github {
 
   async runnerToken() {
     const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { actions } = octokit(this.token, this.repo);
+    const { actions } = octokit(this.token, this.repo, logger);
 
     if (typeof repo !== 'undefined') {
       const {
@@ -212,7 +238,7 @@ class Github {
   async unregisterRunner(opts) {
     const { runnerId } = opts;
     const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { actions } = octokit(this.token, this.repo);
+    const { actions } = octokit(this.token, this.repo, logger);
 
     if (typeof repo !== 'undefined') {
       await actions.deleteSelfHostedRunnerFromRepo({
@@ -229,7 +255,11 @@ class Github {
   }
 
   async startRunner(opts) {
-    const { workdir, single, name, labels } = opts;
+    const { workdir, single, name, labels, env } = opts;
+
+    this.warn(
+      'cloud credentials are no longer available on self-hosted runner steps; please use step.env and secrets instead'
+    );
 
     try {
       const runnerCfg = resolve(workdir, '.runner');
@@ -249,23 +279,28 @@ class Github {
         )}.tar.gz`;
         await download({ url, path: destination });
         await tar.extract({ file: destination, cwd: workdir });
-        await exec(`chmod -R 777 ${workdir}`);
       }
 
       await exec(
-        `${resolve(
-          workdir,
-          'config.sh'
-        )} --unattended  --token "${await this.runnerToken()}" --url "${
-          this.repo
-        }" --name "${name}" --labels "${labels}" --work "${resolve(
-          workdir,
-          '_work'
-        )}" ${single ? ' --ephemeral' : ''}`
+        resolve(workdir, 'config.sh'),
+        '--unattended',
+        '--token',
+        await this.runnerToken(),
+        '--url',
+        this.repo,
+        '--name',
+        name,
+        '--labels',
+        labels,
+        '--work',
+        resolve(workdir, '_work'),
+        // adds `--ephemeral` to the array only if `single` is set
+        ...(single ? ['--ephemeral'] : [])
       );
 
       return spawn(resolve(workdir, 'run.sh'), {
-        shell: true
+        shell: true,
+        env
       });
     } catch (err) {
       throw new Error(`Failed preparing GitHub runner: ${err.message}`);
@@ -274,7 +309,7 @@ class Github {
 
   async runners(opts = {}) {
     const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { paginate, actions } = octokit(this.token, this.repo);
+    const { paginate, actions } = octokit(this.token, this.repo, logger);
 
     let runners;
     if (typeof repo === 'undefined') {
@@ -290,22 +325,114 @@ class Github {
       });
     }
 
-    return runners.map(({ id, name, busy, status, labels }) => ({
+    return runners.map((runner) => this.parseRunner(runner));
+  }
+
+  async runnerById(opts = {}) {
+    const { id } = opts;
+    const { owner, repo } = ownerRepo({ uri: this.repo });
+    const { actions } = octokit(this.token, this.repo, logger);
+
+    if (typeof repo === 'undefined') {
+      const { data: runner } = await actions.getSelfHostedRunnerForOrg({
+        org: owner,
+        runner_id: id
+      });
+
+      return this.parseRunner(runner);
+    }
+
+    const { data: runner } = await actions.getSelfHostedRunnerForRepo({
+      owner,
+      repo,
+      runner_id: id
+    });
+
+    return this.parseRunner(runner);
+  }
+
+  async runnerJob({ runnerId, status = 'queued' } = {}) {
+    const { owner, repo } = ownerRepo({ uri: this.repo });
+    const octokitClient = octokit(this.token, this.repo, logger);
+
+    if (status === 'running') status = 'in_progress';
+
+    const workflowRuns = await octokitClient.paginate(
+      octokitClient.actions.listWorkflowRunsForRepo,
+      { owner, repo, status }
+    );
+
+    let runJobs = await Promise.all(
+      workflowRuns.map(
+        async ({ id }) =>
+          await octokitClient.paginate(
+            octokitClient.actions.listJobsForWorkflowRun,
+            { owner, repo, run_id: id, status }
+          )
+      )
+    );
+
+    runJobs = [].concat.apply([], runJobs);
+
+    for (const job of runJobs) {
+      const { id } = job;
+
+      while (!job.runner_id) {
+        const {
+          data: { runner_id: jobRunnerId }
+        } = await octokitClient.actions.getJobForWorkflowRun({
+          owner,
+          repo,
+          job_id: id
+        });
+
+        job.runner_id = jobRunnerId;
+        if (job.runner_id === runnerId) break;
+        await sleep(16);
+      }
+    }
+
+    runJobs = runJobs.map((job) => {
+      const { id, started_at: date, run_id: runId, runner_id: runnerId } = job;
+      return { id, date, runId, runnerId };
+    });
+
+    return runJobs.find((job) => runnerId === job.runnerId);
+  }
+
+  runnerLogPatterns() {
+    return {
+      ready: /Listening for Jobs/,
+      job_started: /Running job/,
+      job_ended: /completed with result/,
+      job_ended_succeded: /completed with result: Succeeded/
+    };
+  }
+
+  parseRunner(runner) {
+    const { id, name, busy, status, labels } = runner;
+    return {
       id,
       name,
       labels: labels.map(({ name }) => name),
       online: status === 'online',
       busy
-    }));
+    };
   }
 
   async prCreate(opts = {}) {
-    const { source: head, target: base, title, description: body } = opts;
+    const {
+      source: head,
+      target: base,
+      title,
+      description: body,
+      autoMerge
+    } = opts;
     const { owner, repo } = ownerRepo({ uri: this.repo });
     const { pulls } = octokit(this.token, this.repo);
 
     const {
-      data: { html_url: htmlUrl }
+      data: { html_url: htmlUrl, number }
     } = await pulls.create({
       owner,
       repo,
@@ -315,7 +442,172 @@ class Github {
       body
     });
 
+    if (autoMerge)
+      await this.prAutoMerge({
+        pullRequestId: number,
+        mergeMode: autoMerge,
+        base
+      });
     return htmlUrl;
+  }
+
+  /**
+   * @param {{ branch: string }} opts
+   * @returns {Promise<boolean>}
+   */
+  async isProtected({ branch }) {
+    const octo = octokit(this.token, this.repo);
+    const { owner, repo } = this.ownerRepo();
+    try {
+      await octo.repos.getBranchProtection({
+        branch,
+        owner,
+        repo
+      });
+      return true;
+    } catch (error) {
+      const errors = [
+        'Branch not protected',
+        'Upgrade to GitHub Pro or make this repository public to enable this feature.'
+      ];
+      if (errors.includes(error.message)) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * @param {{ pullRequestId: number, base: string }} param0
+   * @returns {Promise<void>}
+   */
+  async prAutoMerge({ pullRequestId, mergeMode, mergeMessage, base }) {
+    const octo = octokit(this.token, this.repo);
+    const graphql = withCustomRequest(octo.request);
+    const { owner, repo } = this.ownerRepo();
+    const [commitHeadline, commitBody] = mergeMessage
+      ? mergeMessage.split(/\n\n(.*)/s)
+      : [];
+    const {
+      data: { node_id: nodeId }
+    } = await octo.pulls.get({ owner, repo, pull_number: pullRequestId });
+    try {
+      await graphql(
+        `
+          mutation autoMerge(
+            $pullRequestId: ID!
+            $mergeMethod: PullRequestMergeMethod
+            $commitHeadline: String
+            $commitBody: String
+          ) {
+            enablePullRequestAutoMerge(
+              input: {
+                pullRequestId: $pullRequestId
+                mergeMethod: $mergeMethod
+                commitHeadline: $commitHeadline
+                commitBody: $commitBody
+              }
+            ) {
+              clientMutationId
+            }
+          }
+        `,
+        {
+          pullRequestId: nodeId,
+          mergeMethod: mergeMode.toUpperCase(),
+          commitHeadline,
+          commitBody
+        }
+      );
+    } catch (err) {
+      const tolerate = [
+        "Can't enable auto-merge for this pull request",
+        'Pull request Protected branch rules not configured for this branch',
+        'Pull request is in clean status'
+      ];
+
+      if (!tolerate.some((message) => err.message.includes(message))) throw err;
+
+      const settingsUrl = `https://github.com/${owner}/${repo}/settings`;
+
+      try {
+        if (await this.isProtected({ branch: base })) {
+          logger.warn(
+            `Failed to enable auto-merge: Enable the feature in your repository settings: ${settingsUrl}#merge_types_auto_merge. Trying to merge immediately...`
+          );
+        } else {
+          logger.warn(
+            `Failed to enable auto-merge: Set up branch protection and add "required status checks" for branch '${base}': ${settingsUrl}/branches. Trying to merge immediately...`
+          );
+        }
+      } catch (err) {
+        if (!err.message.includes('Resource not accessible by integration'))
+          throw err;
+        logger.warn(
+          `Failed to enable auto-merge. Trying to merge immediately...`
+        );
+      }
+
+      await octo.pulls.merge({
+        owner,
+        repo,
+        pull_number: pullRequestId,
+        merge_method: mergeMode,
+        commit_title: commitHeadline,
+        commit_message: commitBody
+      });
+    }
+  }
+
+  async issueCommentCreate(opts = {}) {
+    const { issueId, report } = opts;
+    const { owner, repo } = ownerRepo({ uri: this.repo });
+    const { issues } = octokit(this.token, this.repo);
+
+    const {
+      data: { html_url: htmlUrl }
+    } = await issues.createComment({
+      owner,
+      repo,
+      body: report,
+      issue_number: issueId
+    });
+
+    return htmlUrl;
+  }
+
+  async issueCommentUpdate(opts = {}) {
+    const { id, report } = opts;
+    if (!id) throw new Error('Id is missing updating comment');
+    const { owner, repo } = ownerRepo({ uri: this.repo });
+    const { issues } = octokit(this.token, this.repo);
+
+    const {
+      data: { html_url: htmlUrl }
+    } = await issues.updateComment({
+      owner,
+      repo,
+      body: report,
+      comment_id: id
+    });
+
+    return htmlUrl;
+  }
+
+  async issueComments(opts = {}) {
+    const { issueId } = opts;
+    const { owner, repo } = ownerRepo({ uri: this.repo });
+    const { issues } = octokit(this.token, this.repo);
+
+    const { data: comments } = await issues.listComments({
+      owner,
+      repo,
+      issue_number: issueId
+    });
+
+    return comments.map(({ id, body }) => {
+      return { id, body };
+    });
   }
 
   async prCommentCreate(opts = {}) {
@@ -393,10 +685,58 @@ class Github {
     });
   }
 
+  async pipelineRerun({ id = GITHUB_RUN_ID, jobId } = {}) {
+    const { owner, repo } = ownerRepo({ uri: this.repo });
+    const { actions } = octokit(this.token, this.repo, logger);
+
+    if (!id && jobId) {
+      ({
+        data: { run_id: id }
+      } = await actions.getJobForWorkflowRun({
+        owner,
+        repo,
+        job_id: jobId
+      }));
+    }
+
+    let {
+      data: { status }
+    } = await actions.getWorkflowRun({
+      owner,
+      repo,
+      run_id: id
+    });
+
+    if (status === 'in_progress') {
+      await actions.cancelWorkflowRun({
+        owner,
+        repo,
+        run_id: id
+      });
+
+      while (status === 'in_progress') {
+        ({
+          data: { status }
+        } = await actions.getWorkflowRun({
+          owner,
+          repo,
+          run_id: id
+        }));
+        await sleep(1);
+      }
+    }
+
+    await actions.reRunWorkflow({
+      owner,
+      repo,
+      run_id: id
+    });
+  }
+
   async pipelineJobs(opts = {}) {
     const { jobs: runnerJobs } = opts;
     const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { actions } = octokit(this.token, this.repo);
+    const { actions } = octokit(this.token, this.repo, logger);
 
     const jobs = await Promise.all(
       runnerJobs.map(async (job) => {
@@ -416,87 +756,35 @@ class Github {
     });
   }
 
-  async job(opts = {}) {
-    const { time, status = 'queued' } = opts;
-    const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { actions } = octokit(this.token, this.repo);
+  async updateGitConfig({ userName, userEmail, remote } = {}) {
+    const repo = new URL(this.repo);
+    repo.password = this.token;
+    repo.username = 'token';
 
-    const {
-      data: { workflow_runs: workflowRuns }
-    } = await actions.listWorkflowRunsForRepo({
-      owner,
-      repo,
-      status
-    });
-
-    let runJobs = await Promise.all(
-      workflowRuns.map(async (run) => {
-        const {
-          data: { jobs }
-        } = await actions.listJobsForWorkflowRun({
-          owner,
-          repo,
-          run_id: run.id,
-          status
-        });
-
-        return jobs;
-      })
-    );
-
-    runJobs = [].concat.apply([], runJobs).map((job) => {
-      const { id, started_at: date, run_id: runId } = job;
-      return { id, date, runId };
-    });
-
-    const job = runJobs.reduce((prev, curr) => {
-      const diffTime = (job) => Math.abs(new Date(job.date).getTime() - time);
-      return diffTime(curr) < diffTime(prev) ? curr : prev;
-    });
-
-    return job;
+    return [
+      ['git', 'config', '--unset', 'http.https://github.com/.extraheader'],
+      ['git', 'config', 'user.name', userName || this.userName],
+      ['git', 'config', 'user.email', userEmail || this.userEmail],
+      [
+        'git',
+        'remote',
+        'set-url',
+        remote,
+        repo.toString() + (repo.toString().endsWith('.git') ? '' : '.git')
+      ]
+    ];
   }
 
-  async pipelineRestart(opts = {}) {
-    const { jobId } = opts;
-    const { owner, repo } = ownerRepo({ uri: this.repo });
-    const { actions } = octokit(this.token, this.repo);
+  get workflowId() {
+    return GITHUB_WORKFLOW;
+  }
 
-    const {
-      data: { run_id: runId }
-    } = await actions.getJobForWorkflowRun({
-      owner,
-      repo,
-      job_id: jobId
-    });
+  get runId() {
+    return GITHUB_RUN_ID;
+  }
 
-    try {
-      await actions.cancelWorkflowRun({
-        owner,
-        repo,
-        run_id: runId
-      });
-    } catch (err) {
-      // HANDLES: Cannot cancel a workflow run that is completed.
-    }
-
-    const {
-      data: { status }
-    } = await actions.getWorkflowRun({
-      owner,
-      repo,
-      run_id: runId
-    });
-
-    if (status !== 'queued') {
-      try {
-        await actions.reRunWorkflow({
-          owner,
-          repo,
-          run_id: runId
-        });
-      } catch (err) {}
-    }
+  warn(message) {
+    console.error(`::warning::${message}`);
   }
 
   get sha() {
@@ -504,6 +792,16 @@ class Github {
       return github.context.payload.pull_request.head.sha;
 
     return GITHUB_SHA;
+  }
+
+  /**
+   * Returns the PR number if we're in a PR-related action event.
+   */
+  get pr() {
+    if (['pull_request', 'pull_request_target'].includes(GITHUB_EVENT_NAME)) {
+      return github.context.payload.pull_request.number;
+    }
+    return null;
   }
 
   get branch() {

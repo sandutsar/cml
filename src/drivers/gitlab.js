@@ -5,18 +5,19 @@ const { spawn } = require('child_process');
 const fs = require('fs').promises;
 const fse = require('fs-extra');
 const { resolve } = require('path');
-const ProxyAgent = require('proxy-agent');
+const { ProxyAgent } = require('proxy-agent');
+const { backOff } = require('exponential-backoff');
+const { logger } = require('../logger');
 
-const { fetchUploadData, download, exec } = require('../utils');
+const { fetchUploadData, download, gpuPresent } = require('../utils');
 
-const {
-  IN_DOCKER,
-  CI_BUILD_REF_NAME,
-  CI_COMMIT_SHA,
-  GITLAB_USER_EMAIL,
-  GITLAB_USER_NAME
-} = process.env;
+const { CI_JOB_ID, CI_PIPELINE_ID, IN_DOCKER } = process.env;
+
 const API_VER = 'v4';
+const MAX_COMMENT_SIZE = 1000000;
+const ERROR_COMMENT_SIZE =
+  'GitLab Comment is too large, this is likely caused by the `--publish-native` flag causing the comment to pass the 1M character limit';
+
 class Gitlab {
   constructor(opts = {}) {
     const { repo, token } = opts;
@@ -69,8 +70,10 @@ class Gitlab {
     return this.detectedBase;
   }
 
-  async commentCreate(opts = {}) {
+  async commitCommentCreate(opts = {}) {
     const { commitSha, report } = opts;
+
+    if (report.length >= MAX_COMMENT_SIZE) throw new Error(ERROR_COMMENT_SIZE);
 
     const projectPath = await this.projectPath();
     const endpoint = `/projects/${projectPath}/repository/commits/${commitSha}/comments`;
@@ -82,7 +85,7 @@ class Gitlab {
     return `${this.repo}/-/commit/${commitSha}`;
   }
 
-  async commentUpdate(opts = {}) {
+  async commitCommentUpdate(opts = {}) {
     throw new Error('GitLab does not support comment updates!');
   }
 
@@ -107,14 +110,20 @@ class Gitlab {
     const endpoint = `/projects/${projectPath}/repository/commits/${commitSha}/merge_requests`;
     const prs = await this.request({ endpoint, method: 'GET' });
 
-    return prs.map((pr) => {
-      const { web_url: url, source_branch: source, target_branch: target } = pr;
-      return {
-        url,
-        source,
-        target
-      };
-    });
+    return prs
+      .filter((pr) => pr.state === 'opened')
+      .map((pr) => {
+        const {
+          web_url: url,
+          source_branch: source,
+          target_branch: target
+        } = pr;
+        return {
+          url,
+          source,
+          target
+        };
+      });
   }
 
   async checkCreate() {
@@ -135,11 +144,21 @@ class Gitlab {
     return { uri: `${repo}${url}`, mime, size };
   }
 
-  async runnerToken() {
+  async runnerToken(body) {
     const projectPath = await this.projectPath();
-    const endpoint = `/projects/${projectPath}`;
+    const legacyEndpoint = `/projects/${projectPath}`;
+    const endpoint = `/user/runners`;
 
-    const { runners_token: runnersToken } = await this.request({ endpoint });
+    const { id, runners_token: runnersToken } = await this.request({
+      endpoint: legacyEndpoint
+    });
+
+    if (runnersToken === null) {
+      if (!body) body = new URLSearchParams();
+      body.append('project_id', id);
+      body.append('runner_type', 'project_type');
+      return (await this.request({ endpoint, method: 'POST', body })).token;
+    }
 
     return runnersToken;
   }
@@ -147,16 +166,18 @@ class Gitlab {
   async registerRunner(opts = {}) {
     const { tags, name } = opts;
 
-    const token = await this.runnerToken();
     const endpoint = `/runners`;
     const body = new URLSearchParams();
     body.append('description', name);
     body.append('tag_list', tags);
-    body.append('token', token);
     body.append('locked', 'true');
     body.append('run_untagged', 'true');
     body.append('access_level', 'not_protected');
 
+    const token = await this.runnerToken(new URLSearchParams(body));
+    if (token.startsWith('glrt-')) return { token };
+
+    body.append('token', token);
     return await this.request({ endpoint, method: 'POST', body });
   }
 
@@ -168,44 +189,57 @@ class Gitlab {
   }
 
   async startRunner(opts) {
-    const { workdir, idleTimeout, single, labels, name } = opts;
+    const {
+      workdir,
+      idleTimeout,
+      single,
+      labels,
+      name,
+      dockerVolumes = [],
+      env
+    } = opts;
 
-    let gpu = true;
-    try {
-      await exec('nvidia-smi');
-    } catch (err) {
-      try {
-        await exec('cuda-smi');
-      } catch (err) {
-        gpu = false;
-      }
-    }
+    const gpu = await gpuPresent();
 
     try {
       const bin = resolve(workdir, 'gitlab-runner');
       if (!(await fse.pathExists(bin))) {
-        const url =
-          'https://gitlab-runner-downloads.s3.amazonaws.com/latest/binaries/gitlab-runner-linux-amd64';
+        const arch = process.platform === 'darwin' ? 'darwin' : 'linux';
+        const url = `https://gitlab-runner-downloads.s3.amazonaws.com/latest/binaries/gitlab-runner-${arch}-amd64`;
         await download({ url, path: bin });
         await fs.chmod(bin, '777');
       }
 
       const { protocol, host } = new URL(this.repo);
       const { token } = await this.registerRunner({ tags: labels, name });
+
+      let waitTimeout = idleTimeout;
+      if (idleTimeout === 'never') {
+        waitTimeout = '0';
+      }
+
+      let dockerVolumesTpl = '';
+      dockerVolumes.forEach((vol) => {
+        dockerVolumesTpl += `--docker-volumes ${vol} `;
+      });
       const command = `${bin} --log-format="json" run-single \
         --builds-dir "${workdir}" \
         --cache-dir "${workdir}" \
         --url "${protocol}//${host}" \
         --name "${name}" \
         --token "${token}" \
-        --wait-timeout ${idleTimeout} \
+        --wait-timeout ${waitTimeout} \
         --executor "${IN_DOCKER ? 'shell' : 'docker'}" \
         --docker-image "iterativeai/cml:${gpu ? 'latest-gpu' : 'latest'}" \
-        --docker-runtime "${gpu ? 'nvidia' : ''}" \
+        ${gpu ? '--docker-runtime nvidia' : ''} \
+        ${dockerVolumesTpl} \
         ${single ? '--max-builds 1' : ''}`;
 
-      return spawn(command, { shell: true });
+      return spawn(command, { shell: true, env });
     } catch (err) {
+      if (err.message === 'Forbidden')
+        err.message +=
+          ', check the permissions (scopes) of your GitLab token.\nSee https://cml.dev/doc/self-hosted-runners?tab=GitLab#personal-access-token';
       throw new Error(`Failed preparing Gitlab runner: ${err.message}`);
     }
   }
@@ -214,41 +248,164 @@ class Gitlab {
     const endpoint = `/runners?per_page=100`;
     const runners = await this.request({ endpoint, method: 'GET' });
     return await Promise.all(
-      runners.map(async ({ id, description, active, online }) => ({
+      runners.map(async ({ id, description, online }) => ({
         id,
         name: description,
+        busy:
+          (
+            await this.request({
+              endpoint: `/runners/${id}/jobs`,
+              method: 'GET'
+            })
+          ).filter((job) => job.status === 'running').length > 0,
         labels: (
           await this.request({ endpoint: `/runners/${id}`, method: 'GET' })
         ).tag_list,
-        online,
-        busy: active && online
+        online
       }))
     );
   }
 
+  async runnerById({ id } = {}) {
+    const {
+      description,
+      online,
+      tag_list: labels
+    } = await this.request({
+      endpoint: `/runners/${id}`,
+      method: 'GET'
+    });
+
+    return {
+      id,
+      name: description,
+      labels,
+      online
+    };
+  }
+
+  runnerLogPatterns() {
+    return {
+      ready: /Starting runner for/,
+      job_started: /"job":.+received/,
+      job_ended: /"duration_s":/,
+      job_ended_succeded: /"duration_s":.+Job succeeded/,
+      job: /"job":([0-9]+),"/
+    };
+  }
+
   async prCreate(opts = {}) {
     const projectPath = await this.projectPath();
-    const { source, target, title, description } = opts;
+    const { source, target, title, description, skipCi, autoMerge } = opts;
 
+    const prTitle = skipCi ? title + ' [skip ci]' : title;
     const endpoint = `/projects/${projectPath}/merge_requests`;
     const body = new URLSearchParams();
     body.append('source_branch', source);
     body.append('target_branch', target);
-    body.append('title', title);
+    body.append('title', prTitle);
     body.append('description', description);
 
-    const { web_url: url } = await this.request({
+    const { web_url: url, iid } = await this.request({
       endpoint,
       method: 'POST',
       body
     });
 
+    if (autoMerge)
+      await this.prAutoMerge({ pullRequestId: iid, mergeMode: autoMerge });
     return url;
+  }
+
+  /**
+   * @param {{ pullRequestId: string }} param0
+   * @returns {Promise<void>}
+   */
+  async prAutoMerge({ pullRequestId, mergeMode, mergeMessage }) {
+    if (mergeMode === 'rebase')
+      throw new Error(`Rebase auto-merge mode not implemented for GitLab`);
+
+    const projectPath = await this.projectPath();
+
+    const endpoint = `/projects/${projectPath}/merge_requests/${pullRequestId}/merge`;
+    const body = new URLSearchParams();
+    body.set('merge_when_pipeline_succeeds', true);
+    body.set('squash', mergeMode === 'squash');
+    if (mergeMessage) body.set(`${mergeMode}_commit_message`, mergeMessage);
+
+    try {
+      await backOff(() =>
+        this.request({
+          endpoint,
+          method: 'PUT',
+          body
+        })
+      );
+    } catch ({ message }) {
+      logger.warn(
+        `Failed to enable auto-merge: ${message}. Trying to merge immediately...`
+      );
+      body.set('merge_when_pipeline_succeeds', false);
+      this.request({
+        endpoint,
+        method: 'PUT',
+        body
+      });
+    }
+  }
+
+  async issueCommentUpsert(opts = {}) {
+    const projectPath = await this.projectPath();
+    const { issueId, report, id: commentId } = opts;
+
+    if (report.length >= MAX_COMMENT_SIZE) throw new Error(ERROR_COMMENT_SIZE);
+
+    const endpoint =
+      `/projects/${projectPath}/issues/${issueId}/notes` +
+      `${commentId ? '/' + commentId : ''}`;
+    const body = new URLSearchParams();
+    body.append('body', report);
+
+    const { id } = await this.request({
+      endpoint,
+      method: commentId ? 'PUT' : 'POST',
+      body
+    });
+
+    return `${this.repo}/-/issues/${issueId}#note_${id}`;
+  }
+
+  async issueCommentCreate(opts = {}) {
+    const { id, ...rest } = opts;
+    return this.issueCommentUpsert(rest);
+  }
+
+  async issueCommentUpdate(opts = {}) {
+    if (!opts.id) throw new Error('Id is missing updating comment');
+    return this.issueCommentUpsert(opts);
+  }
+
+  async issueComments(opts = {}) {
+    const projectPath = await this.projectPath();
+    const { issueId } = opts;
+
+    const endpoint = `/projects/${projectPath}/issues/${issueId}/notes`;
+
+    const comments = await this.request({
+      endpoint,
+      method: 'GET'
+    });
+
+    return comments.map(({ id, body }) => {
+      return { id, body };
+    });
   }
 
   async prCommentCreate(opts = {}) {
     const projectPath = await this.projectPath();
     const { report, prNumber } = opts;
+
+    if (report.length >= MAX_COMMENT_SIZE) throw new Error(ERROR_COMMENT_SIZE);
 
     const endpoint = `/projects/${projectPath}/merge_requests/${prNumber}/notes`;
     const body = new URLSearchParams();
@@ -266,6 +423,8 @@ class Gitlab {
   async prCommentUpdate(opts = {}) {
     const projectPath = await this.projectPath();
     const { report, prNumber, id: commentId } = opts;
+
+    if (report.length >= MAX_COMMENT_SIZE) throw new Error(ERROR_COMMENT_SIZE);
 
     const endpoint = `/projects/${projectPath}/merge_requests/${prNumber}/notes/${commentId}`;
     const body = new URLSearchParams();
@@ -313,39 +472,94 @@ class Gitlab {
     });
   }
 
-  async pipelineRestart(opts = {}) {
+  async pipelineRerun({ id = CI_PIPELINE_ID, jobId } = {}) {
     const projectPath = await this.projectPath();
-    const { jobId } = opts;
 
-    const {
-      pipeline: { id }
-    } = await this.request({
-      endpoint: `/projects/${projectPath}/jobs/${jobId}`
+    if (!id && jobId) {
+      ({
+        pipeline: { id }
+      } = await this.request({
+        endpoint: `/projects/${projectPath}/jobs/${jobId}`
+      }));
+    }
+
+    const { status } = await this.request({
+      endpoint: `/projects/${projectPath}/pipelines/${id}`,
+      method: 'GET'
     });
 
-    let status;
-    while (!status || status === 'running')
-      ({ status } = await this.request({
+    if (status === 'running') {
+      await this.request({
         endpoint: `/projects/${projectPath}/pipelines/${id}/cancel`,
         method: 'POST'
-      }));
+      });
+    }
 
-    const jobs = await this.request({
-      endpoint: `/projects/${projectPath}/pipelines/${id}/jobs`
+    await this.request({
+      endpoint: `/projects/${projectPath}/pipelines/${id}/retry`,
+      method: 'POST'
     });
-
-    await Promise.all(
-      jobs.map(async (job) => {
-        return this.request({
-          endpoint: `/projects/${projectPath}/jobs/${job.id}/retry`,
-          method: 'POST'
-        });
-      })
-    );
   }
 
   async pipelineJobs(opts = {}) {
     throw new Error('Not implemented');
+  }
+
+  async updateGitConfig({ userName, userEmail, remote } = {}) {
+    const repo = new URL(this.repo);
+    repo.password = this.token;
+    repo.username = 'token';
+
+    const commands = [
+      ['git', 'config', 'user.name', userName || this.userName],
+      ['git', 'config', 'user.email', userEmail || this.userEmail],
+      [
+        'git',
+        'remote',
+        'set-url',
+        remote,
+        repo.toString() + (repo.toString().endsWith('.git') ? '' : '.git')
+      ]
+    ];
+
+    return commands;
+  }
+
+  get workflowId() {
+    return CI_PIPELINE_ID;
+  }
+
+  get runId() {
+    return CI_JOB_ID;
+  }
+
+  get sha() {
+    return process.env.CI_COMMIT_SHA;
+  }
+
+  /**
+   * Returns the PR number if we're in a PR-related action event.
+   */
+  get pr() {
+    if ('CI_MERGE_REQUEST_IID' in process.env) {
+      return process.env.CI_MERGE_REQUEST_IID;
+    }
+    return null;
+  }
+
+  get branch() {
+    if ('CI_COMMIT_BRANCH' in process.env) {
+      return process.env.CI_COMMIT_BRANCH;
+    }
+    return process.env.CI_COMMIT_REF_NAME;
+  }
+
+  get userEmail() {
+    return process.env.GITLAB_USER_EMAIL;
+  }
+
+  get userName() {
+    return process.env.GITLAB_USER_NAME;
   }
 
   async request(opts = {}) {
@@ -358,6 +572,8 @@ class Gitlab {
     }
     if (!url) throw new Error('Gitlab API endpoint not found');
 
+    logger.debug(`Gitlab API request, method: ${method}, url: "${url}"`);
+
     const headers = { 'PRIVATE-TOKEN': token, Accept: 'application/json' };
     const response = await fetch(url, {
       method,
@@ -365,26 +581,17 @@ class Gitlab {
       body,
       agent: new ProxyAgent()
     });
-    if (response.status > 300) throw new Error(response.statusText);
+    if (!response.ok) {
+      logger.debug(`Response status is ${response.status}`);
+      throw new Error(response.statusText);
+    }
     if (raw) return response;
 
     return await response.json();
   }
 
-  get sha() {
-    return CI_COMMIT_SHA;
-  }
-
-  get branch() {
-    return CI_BUILD_REF_NAME;
-  }
-
-  get userEmail() {
-    return GITLAB_USER_EMAIL;
-  }
-
-  get userName() {
-    return GITLAB_USER_NAME;
+  warn(message) {
+    logger.warn(message);
   }
 }
 

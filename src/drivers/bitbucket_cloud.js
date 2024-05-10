@@ -1,9 +1,20 @@
+const crypto = require('crypto');
 const fetch = require('node-fetch');
-const winston = require('winston');
 const { URL } = require('url');
-const ProxyAgent = require('proxy-agent');
+const { spawn } = require('child_process');
+const FormData = require('form-data');
+const { ProxyAgent } = require('proxy-agent');
+const { logger } = require('../logger');
 
-const { BITBUCKET_COMMIT, BITBUCKET_BRANCH } = process.env;
+const { fetchUploadData, exec, gpuPresent, sleep } = require('../utils');
+
+const {
+  BITBUCKET_COMMIT,
+  BITBUCKET_BRANCH,
+  BITBUCKET_PIPELINE_UUID,
+  BITBUCKET_BUILD_NUMBER
+} = process.env;
+
 class BitbucketCloud {
   constructor(opts = {}) {
     const { repo, token } = opts;
@@ -22,7 +33,45 @@ class BitbucketCloud {
     }
   }
 
-  async commentCreate(opts = {}) {
+  async issueCommentUpsert(opts = {}) {
+    const { projectPath } = this;
+    const { issueId, report, id } = opts;
+
+    const endpoint =
+      `/repositories/${projectPath}/issues/${issueId}/` +
+      `comments/${id ? id + '/' : ''}`;
+    return (
+      await this.request({
+        endpoint,
+        method: id ? 'PUT' : 'POST',
+        body: JSON.stringify({ content: { raw: report } })
+      })
+    ).links.html.href;
+  }
+
+  async issueCommentCreate(opts = {}) {
+    const { id, ...rest } = opts;
+    return this.issueCommentUpsert(rest);
+  }
+
+  async issueCommentUpdate(opts = {}) {
+    if (!opts.id) throw new Error('Id is missing updating comment');
+    return this.issueCommentUpsert(opts);
+  }
+
+  async issueComments(opts = {}) {
+    const { projectPath } = this;
+    const { issueId } = opts;
+
+    const endpoint = `/repositories/${projectPath}/issues/${issueId}/comments/`;
+    return (await this.paginatedRequest({ endpoint, method: 'GET' })).map(
+      ({ id, content: { raw: body = '' } = {} }) => {
+        return { id, body };
+      }
+    );
+  }
+
+  async commitCommentCreate(opts = {}) {
     const { projectPath } = this;
     const { commitSha, report } = opts;
 
@@ -36,7 +85,7 @@ class BitbucketCloud {
     ).links.html.href;
   }
 
-  async commentUpdate(opts = {}) {
+  async commitCommentUpdate(opts = {}) {
     const { projectPath } = this;
     const { commitSha, report, id } = opts;
 
@@ -86,28 +135,147 @@ class BitbucketCloud {
   }
 
   async upload(opts = {}) {
-    throw new Error('Bitbucket Cloud does not support upload!');
+    const { projectPath } = this;
+    const { size, mime, data } = await fetchUploadData(opts);
+
+    const chunks = [];
+    for await (const chunk of data) chunks.push(chunk);
+    const buffer = Buffer.concat(chunks);
+
+    const filename = `cml-${crypto
+      .createHash('sha256')
+      .update(buffer)
+      .digest('hex')}`;
+    const body = new FormData();
+    body.append('files', buffer, { filename });
+
+    const endpoint = `/repositories/${projectPath}/downloads`;
+    await this.request({ endpoint, method: 'POST', body });
+    return {
+      uri: `https://bitbucket.org/${decodeURIComponent(
+        projectPath
+      )}/downloads/${filename}`,
+      mime,
+      size
+    };
   }
 
   async runnerToken() {
-    throw new Error('Bitbucket Cloud does not support runnerToken!');
+    return 'DUMMY';
+  }
+
+  async startRunner(opts) {
+    const { projectPath } = this;
+    const { workdir, name, labels, env } = opts;
+
+    logger.warn(
+      `Bitbucket runner is working under /tmp folder and not under ${workdir} as expected`
+    );
+
+    try {
+      const { uuid: accountId } = await this.request({ endpoint: `/user` });
+      const { uuid: repoId } = await this.request({
+        endpoint: `/repositories/${projectPath}`
+      });
+      const {
+        uuid,
+        oauth_client: { id, secret }
+      } = await this.registerRunner({ name, labels });
+
+      const gpu = await gpuPresent();
+      const command = `docker container run -t -a stderr -a stdout --rm \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v /var/lib/docker/containers:/var/lib/docker/containers:ro \
+      -v /tmp:/tmp \
+      -e ACCOUNT_UUID=${accountId} \
+      -e REPOSITORY_UUID=${repoId} \
+      -e RUNNER_UUID=${uuid} \
+      -e OAUTH_CLIENT_ID=${id} \
+      -e OAUTH_CLIENT_SECRET=${secret} \
+      -e WORKING_DIRECTORY=/tmp \
+      --name ${name} \
+      ${gpu ? '--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all' : ''} \
+      docker-public.packages.atlassian.com/sox/atlassian/bitbucket-pipelines-runner:1`;
+
+      return spawn(command, { shell: true, env });
+    } catch (err) {
+      throw new Error(`Failed preparing runner: ${err.message}`);
+    }
   }
 
   async registerRunner(opts = {}) {
-    throw new Error('Bitbucket Cloud does not support registerRunner!');
+    const { projectPath } = this;
+    const { name, labels } = opts;
+
+    const endpoint = `/repositories/${projectPath}/pipelines-config/runners`;
+
+    const request = await this.request({
+      api: 'https://api.bitbucket.org/internal',
+      endpoint,
+      method: 'POST',
+      body: JSON.stringify({
+        labels: ['self.hosted'].concat(labels.split(',')),
+        name
+      })
+    });
+
+    let registered = false;
+    while (!registered) {
+      await sleep(1);
+      const runner = (await this.runners()).find(
+        (runner) => runner.name === name
+      );
+      if (runner) registered = true;
+    }
+
+    return request;
   }
 
   async unregisterRunner(opts = {}) {
-    throw new Error('Bitbucket Cloud does not support unregisterRunner!');
+    const { projectPath } = this;
+    const { runnerId, name } = opts;
+    const endpoint = `/repositories/${projectPath}/pipelines-config/runners/${runnerId}`;
+
+    try {
+      await this.request({
+        api: 'https://api.bitbucket.org/internal',
+        endpoint,
+        method: 'DELETE'
+      });
+    } catch (err) {
+      if (!err.message.includes('invalid json response body')) {
+        throw err;
+      }
+    } finally {
+      await exec('docker', 'stop', name);
+    }
   }
 
   async runners(opts = {}) {
-    throw new Error('Bitbucket Cloud does not support runners!');
+    const { projectPath } = this;
+
+    const endpoint = `/repositories/${projectPath}/pipelines-config/runners`;
+    const runners = await this.paginatedRequest({
+      api: 'https://api.bitbucket.org/internal',
+      endpoint
+    });
+
+    return runners.map(({ uuid: id, name, labels, state: { status } }) => ({
+      id,
+      name,
+      labels,
+      online: status === 'ONLINE',
+      busy: status === 'ONLINE'
+    }));
+  }
+
+  async runnerById(opts = {}) {
+    throw new Error('Not yet implemented');
   }
 
   async prCreate(opts = {}) {
     const { projectPath } = this;
-    const { source, target, title, description } = opts;
+    const { source, target, title, description, autoMerge } = opts;
 
     const body = JSON.stringify({
       title,
@@ -125,6 +293,7 @@ class BitbucketCloud {
     });
     const endpoint = `/repositories/${projectPath}/pullrequests/`;
     const {
+      id,
       links: {
         html: { href }
       }
@@ -134,7 +303,43 @@ class BitbucketCloud {
       body
     });
 
+    if (autoMerge)
+      await this.prAutoMerge({ pullRequestId: id, mergeMode: autoMerge });
     return href;
+  }
+
+  runnerLogPatterns() {
+    return {
+      ready: /Updating runner status to "ONLINE"/,
+      job_started: /Getting step StepId/,
+      job_ended: /Completing step with result/,
+      job_ended_succeded: /Completing step with result Result{status=PASSED/,
+      pipeline: /pipelineUuid=({.+}), /,
+      job: /stepUuid=({.+})}/
+    };
+  }
+
+  async prAutoMerge({ pullRequestId, mergeMode, mergeMessage }) {
+    logger.warn(
+      'Auto-merge is unsupported by Bitbucket Cloud; see https://jira.atlassian.com/browse/BCLOUD-14286. Trying to merge immediately...'
+    );
+    const { projectPath } = this;
+    const endpoint = `/repositories/${projectPath}/pullrequests/${pullRequestId}/merge`;
+    const mergeModes = {
+      merge: 'merge_commit',
+      rebase: 'fast_forward',
+      squash: 'squash'
+    };
+    const body = JSON.stringify({
+      merge_strategy: mergeModes[mergeMode],
+      close_source_branch: true,
+      message: mergeMessage
+    });
+    await this.request({
+      method: 'POST',
+      endpoint,
+      body
+    });
   }
 
   async prCommentCreate(opts = {}) {
@@ -211,13 +416,88 @@ class BitbucketCloud {
     }
   }
 
-  async pipelineRestart(opts = {}) {
-    throw new Error('BitBucket Cloud does not support workflowRestart!');
+  async pipelineRerun({ id = BITBUCKET_PIPELINE_UUID, jobId } = {}) {
+    const { projectPath } = this;
+
+    if (!id && jobId)
+      logger.warn('BitBucket Cloud does not support pipelineRerun by jobId!');
+
+    const { target } = await this.request({
+      endpoint: `/repositories/${projectPath}/pipelines/${id}`,
+      method: 'GET'
+    });
+
+    await this.request({
+      endpoint: `/repositories/${projectPath}/pipelines/`,
+      method: 'POST',
+      body: JSON.stringify({ target })
+    });
   }
 
   async pipelineJobs(opts = {}) {
-    throw new Error('Not implemented');
+    logger.warn('BitBucket Cloud does not support pipelineJobs yet!');
+
+    return [];
   }
+
+  async updateGitConfig({ userName, userEmail, remote } = {}) {
+    const [user, password] = Buffer.from(this.token, 'base64')
+      .toString('utf-8')
+      .split(':');
+
+    const repo = new URL(this.repo);
+    repo.password = password;
+    repo.username = user;
+    repo.protocol = 'https';
+    repo.pathname = repo.pathname.replace('.git', '');
+
+    const commands = [
+      ['git', 'config', '--unset', 'user.name'],
+      ['git', 'config', '--unset', 'user.email'],
+      ['git', 'config', '--unset', 'push.default'],
+      [
+        'git',
+        'config',
+        '--unset',
+        `http.http://${repo.host}${repo.pathname}.proxy`
+      ],
+      ['git', 'config', 'user.name', userName || this.userName],
+      ['git', 'config', 'user.email', userEmail || this.userEmail],
+      ['git', 'remote', 'set-url', remote, repo.toString()]
+    ];
+
+    return commands;
+  }
+
+  get workflowId() {
+    return BITBUCKET_PIPELINE_UUID;
+  }
+
+  get runId() {
+    return BITBUCKET_BUILD_NUMBER;
+  }
+
+  get sha() {
+    return BITBUCKET_COMMIT;
+  }
+
+  /**
+   * Returns the PR number if we're in a PR-related action event.
+   */
+  get pr() {
+    if ('BITBUCKET_PR_ID' in process.env) {
+      return process.env.BITBUCKET_PR_ID;
+    }
+    return null;
+  }
+
+  get branch() {
+    return BITBUCKET_BRANCH;
+  }
+
+  get userEmail() {}
+
+  get userName() {}
 
   async paginatedRequest(opts = {}) {
     const { method = 'GET', body } = opts;
@@ -236,19 +516,20 @@ class BitbucketCloud {
   }
 
   async request(opts = {}) {
-    const { token, api } = this;
-    const { url, endpoint, method = 'GET', body } = opts;
+    const { token } = this;
+    const { url, endpoint, method = 'GET', body, api = this.api } = opts;
 
     if (!(url || endpoint))
       throw new Error('Bitbucket Cloud API endpoint not found');
-    const headers = {
-      'Content-Type': 'application/json',
-      Authorization: 'Basic ' + `${token}`
-    };
+
+    const headers = { Authorization: `Basic ${token}` };
+    if (!body || body.constructor !== FormData)
+      headers['Content-Type'] = 'application/json';
 
     const requestUrl = url || `${api}${endpoint}`;
-    winston.debug(`${method} ${requestUrl}`);
-
+    logger.debug(
+      `Bitbucket API request, method: ${method}, url: "${requestUrl}"`
+    );
     const response = await fetch(requestUrl, {
       method,
       headers,
@@ -256,33 +537,29 @@ class BitbucketCloud {
       agent: new ProxyAgent()
     });
 
-    if (response.status > 300) {
-      try {
-        const json = await response.json();
-        winston.debug(json);
-        // Attempt to get additional context. We have observed two different error schemas
-        // from BitBucket API responses: `{"error": {"message": "Error message"}}` and
-        // `{"error": "Error message"}`.
-        throw new Error(json.error.message || json.error);
-      } catch (err) {
-        throw new Error(`${response.statusText} ${err.message}`);
-      }
+    const responseBody = response.headers.get('Content-Type').includes('json')
+      ? await response.json()
+      : await response.text();
+
+    if (!response.ok) {
+      logger.debug(`Response status is ${response.status}`);
+      // Attempt to get additional context. We have observed two different error schemas
+      // from BitBucket API responses: `{"error": {"message": "Error message"}}` and
+      // `{"error": "Error message"}`, apart from plain text responses like `Bad Request`.
+      const { error } = responseBody.error
+        ? responseBody
+        : { error: responseBody };
+      throw new Error(
+        `${response.statusText} ${error.message || error}`.trim()
+      );
     }
 
-    return await response.json();
+    return responseBody;
   }
 
-  get sha() {
-    return BITBUCKET_COMMIT;
+  warn(message) {
+    logger.warn(message);
   }
-
-  get branch() {
-    return BITBUCKET_BRANCH;
-  }
-
-  get userEmail() {}
-
-  get userName() {}
 }
 
 module.exports = BitbucketCloud;

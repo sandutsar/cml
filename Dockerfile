@@ -1,5 +1,6 @@
 ARG BASE_IMAGE=ubuntu:20.04
 FROM ${BASE_IMAGE}
+ARG BASE_IMAGE
 
 LABEL maintainer="CML <support@cml.dev>"
 
@@ -9,6 +10,20 @@ RUN echo 'APT::Get::Assume-Yes "true";' > /etc/apt/apt.conf.d/90assumeyes
 
 # CONFIGURE SHELL
 SHELL ["/bin/bash", "-c"]
+
+# FIX NVIDIA APT GPG KEYS (https://github.com/NVIDIA/cuda-repo-management/issues/1#issuecomment-1111490201) 🤬
+RUN grep nvidia <<< ${BASE_IMAGE} \
+ && for list in cuda nvidia-ml; do mv /etc/apt/sources.list.d/$list.list{,.backup}; done \
+ && apt-get update \
+ && apt-get install --yes gpg \
+ && apt-key del 7fa2af80 \
+ && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1604/x86_64/3bf863cc.pub \
+ && apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/machine-learning/repos/ubuntu1404/x86_64/7fa2af80.pub \
+ && apt-get purge --yes gpg \
+ && apt-get clean \
+ && rm --recursive --force /var/lib/apt/lists/* \
+ && for list in cuda nvidia-ml; do mv /etc/apt/sources.list.d/$list.list{.backup,}; done \
+ || true
 
 # INSTALL CORE DEPENDENCIES
 RUN apt-get update \
@@ -53,6 +68,11 @@ RUN curl --location https://apt.releases.hashicorp.com/gpg | sudo apt-key add - 
  && apt-get clean \
  && rm --recursive --force /var/lib/apt/lists/*
 
+# INSTALL LEO
+RUN curl --location https://github.com/iterative/terraform-provider-iterative/releases/latest/download/leo_linux_amd64 \
+ --output /usr/bin/leo \
+ && chmod +x /usr/bin/leo
+
 # INSTALL PYTHON
 ARG PYTHON_VERSION=3
 RUN add-apt-repository universe --yes \
@@ -65,7 +85,7 @@ RUN add-apt-repository universe --yes \
  && rm --recursive --force /var/lib/apt/lists/*
 
 # INSTALL DVC
-ARG DVC_VERSION=2
+ARG DVC_VERSION=3
 RUN cd /etc/apt/sources.list.d \
  && wget https://dvc.org/deb/dvc.list \
  && apt-get update \
@@ -91,7 +111,7 @@ RUN add-apt-repository universe --yes \
  && apt-get clean \
  && rm --recursive --force /var/lib/apt/lists/* \
  && npm config set user 0 \
- && npm install --global canvas@2 vega@5 vega-cli@5 vega-lite@4
+ && npm install --global canvas@2 vega@5 vega-cli@5 vega-lite@5.14.1
 
 # CONFIGURE RUNNER PATH
 ENV CML_RUNNER_PATH=/home/runner
@@ -101,6 +121,8 @@ WORKDIR ${CML_RUNNER_PATH}
 # SET SPECIFIC ENVIRONMENT VARIABLES
 ENV IN_DOCKER=1
 ENV RUNNER_ALLOW_RUNASROOT=1
+# Environment variable used by cml to detect it's been installed using the docker image.
+ENV _CML_CONTAINER_IMAGE=true
 
 # DEFINE ENTRY POINT AND COMMAND
 # Smart entrypoint understands commands like `bash` or `/bin/sh` but defaults to `cml`;
